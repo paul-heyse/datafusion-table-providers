@@ -234,6 +234,39 @@ pub struct PostgresConnectionPool {
 }
 
 impl PostgresConnectionPool {
+    /// Create a bounded pool from a typed connection configuration. No connection-string
+    /// interpolation is needed, and the caller controls session options before connecting.
+    pub async fn new_with_config(
+        config: Config,
+        ssl_mode: &str,
+        rootcert: Option<PathBuf>,
+        max_connections: u32,
+        acquire_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        if !(1..=32).contains(&max_connections)
+            || acquire_timeout.is_zero() || acquire_timeout.as_secs() > 60
+        {
+            return InvalidParameterSnafu { parameter_name: "pool limits".to_string() }.fail();
+        }
+        let certs = match rootcert {
+            Some(path) => { let bytes = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?; Some(parse_certs(&bytes)?) },
+            None => None,
+        };
+        let tls = get_tls_connector(ssl_mode, certs)?;
+        let join_push_down = get_join_context(&config);
+        let pool = bb8::Pool::builder()
+            .max_size(max_connections)
+            .connection_timeout(acquire_timeout)
+            .idle_timeout(Some(std::time::Duration::from_secs(60)))
+            .max_lifetime(Some(std::time::Duration::from_secs(1800)))
+            .error_sink(Box::new(PostgresErrorSink::new()))
+            .build(ConnectionManager::new(config, MakeTlsConnector::new(tls))).await.map_err(map_pool_build_error)?;
+        { let conn = pool.get().await.map_err(map_pool_run_error)?;
+          conn.execute("SELECT 1", &[]).await.context(ConnectionPoolSnafu)?; }
+        Ok(Self { pool: Arc::new(pool), join_push_down,
+            unsupported_type_action: UnsupportedTypeAction::Error, io_handle: None })
+    }
+
     /// Creates a new instance of `PostgresConnectionPool`.
     ///
     /// If a `pass` parameter is present, it is wrapped in a [`StaticPasswordProvider`]
@@ -748,5 +781,17 @@ mod tests {
 
         assert_eq!(config.get_options(), None);
         assert_eq!(config.get_application_name(), None);
+    }
+}
+
+#[cfg(test)]
+mod bounded_pool_tests {
+    use super::*;
+    #[tokio::test]
+    async fn limits_are_rejected_before_network_access() {
+        for (size, seconds) in [(0, 5), (33, 5), (2, 0), (2, 61)] {
+            assert!(PostgresConnectionPool::new_with_config(Config::new(), "disable", None,
+                size, std::time::Duration::from_secs(seconds)).await.is_err());
+        }
     }
 }
