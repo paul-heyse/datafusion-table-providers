@@ -248,19 +248,30 @@ pub async fn get_schema<T: 'static, P: 'static>(
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub async fn query_arrow<T, P>(
+pub async fn query_arrow<T: 'static, P: 'static>(
     conn: Box<dyn DbConnection<T, P>>,
     sql: String,
     projected_schema: Option<SchemaRef>,
 ) -> Result<SendableRecordBatchStream, Error> {
-    if let Some(conn) = conn.as_sync() {
-        conn.query_arrow(&sql, &[], projected_schema)
-            .context(UnableToQueryArrowSnafu {})
-    } else if let Some(conn) = conn.as_async() {
-        conn.query_arrow(&sql, &[], projected_schema)
+    let output = if let Some(driver) = conn.as_sync() {
+        driver
+            .query_arrow(&sql, &[], projected_schema)
+            .context(UnableToQueryArrowSnafu {})?
+    } else if let Some(driver) = conn.as_async() {
+        driver
+            .query_arrow(&sql, &[], projected_schema)
             .await
-            .context(UnableToQueryArrowSnafu {})
+            .context(UnableToQueryArrowSnafu {})?
     } else {
-        Err(Error::UnableToDowncastConnection {})
-    }
+        return Err(Error::UnableToDowncastConnection {});
+    };
+    let schema = output.schema();
+    // Retain the actual pool lease until EOF or stream drop. A RowStream alone is not a lease.
+    let stream = futures::stream::unfold((conn, output), |(conn, mut output)| async move {
+        use futures::StreamExt;
+        output.next().await.map(|batch| (batch, (conn, output)))
+    });
+    Ok(Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream),
+    ))
 }

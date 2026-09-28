@@ -1,4 +1,5 @@
 [package]
+workspace = "../.."
 name = "datafusion-table-providers-common"
 version = { workspace = true }
 readme = { workspace = true }

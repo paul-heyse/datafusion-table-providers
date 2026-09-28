@@ -127,18 +127,38 @@ impl From<tokio_postgres::Error> for ConnectionManagerError {
 ///
 /// When no provider is set (passwordless auth), the manager connects using the
 /// stored [`Config`] as-is.
+#[derive(Debug, Default)]
+pub struct ReadMetrics {
+    pub query_wait_ns: std::sync::atomic::AtomicU64,
+    pub conversion_ns: std::sync::atomic::AtomicU64,
+    pub rows: std::sync::atomic::AtomicU64,
+}
+impl ReadMetrics {
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.query_wait_ns.load(Relaxed),
+            self.conversion_ns.load(Relaxed),
+            self.rows.load(Relaxed),
+        )
+    }
+}
 pub struct ConnectionManager {
+    metrics: Arc<ReadMetrics>,
+    permits: Arc<tokio::sync::Semaphore>,
     config: Config,
     tls: MakeTlsConnector,
     password_provider: Option<Arc<dyn PasswordProvider>>,
 }
 
 impl ConnectionManager {
-    fn new(config: Config, tls: MakeTlsConnector) -> Self {
+    fn new(config: Config, tls: MakeTlsConnector, capacity: u32) -> Self {
         Self {
             config,
             tls,
             password_provider: None,
+            metrics: Arc::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(capacity as usize)),
         }
     }
 
@@ -185,11 +205,85 @@ async fn configure_session(
     Ok(())
 }
 
+/// A lease retains physical capacity until cancelled server work has drained.
+pub struct ManagedClient {
+    connection_task: tokio::task::AbortHandle,
+    pub(crate) metrics: Arc<ReadMetrics>,
+    client: Option<tokio_postgres::Client>,
+    tls: MakeTlsConnector,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(crate) streaming: Arc<std::sync::atomic::AtomicBool>,
+}
+impl std::fmt::Debug for ManagedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedClient")
+            .field("streaming", &self.streaming)
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for ManagedClient {
+    fn drop(&mut self) {
+        if self.streaming.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(runtime) = Handle::try_current() {
+                let client = self.client.take().expect("owned client");
+                let tls = self.tls.clone();
+                let task = self.connection_task.clone();
+                let permit = self.permit.take().expect("owned capacity");
+                runtime.spawn(async move {
+                    // Sending CancelRequest alone has no acknowledgement. A subsequent
+                    // round trip proves the original request has left the server.
+                    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        client.cancel_token().cancel_query(tls).await?;
+                        client.simple_query("").await?;
+                        Ok::<_, tokio_postgres::Error>(())
+                    })
+                    .await;
+                    if !matches!(drained, Ok(Ok(()))) {
+                        // Uncertain server work must not create extra pool capacity.
+                        // This slot stays quarantined until the pool is recreated.
+                        permit.forget();
+                        tracing::warn!("postgres cancellation unconfirmed; pool slot quarantined");
+                    }
+                    task.abort();
+                });
+                return;
+            }
+        }
+        self.connection_task.abort();
+    }
+}
+impl ManagedClient {
+    pub fn start_request(&self) {
+        self.streaming
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn finish_request(&self) {
+        self.streaming
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+impl std::ops::Deref for ManagedClient {
+    type Target = tokio_postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("owned client")
+    }
+}
+impl std::ops::DerefMut for ManagedClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("owned client")
+    }
+}
 impl bb8::ManageConnection for ConnectionManager {
-    type Connection = tokio_postgres::Client;
+    type Connection = ManagedClient;
     type Error = ConnectionManagerError;
 
-    async fn connect(&self) -> std::result::Result<tokio_postgres::Client, ConnectionManagerError> {
+    async fn connect(&self) -> std::result::Result<ManagedClient, ConnectionManagerError> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("capacity semaphore never closed");
         let (client, connection) = if let Some(provider) = &self.password_provider {
             let password = provider
                 .get_password()
@@ -201,32 +295,40 @@ impl bb8::ManageConnection for ConnectionManager {
         } else {
             self.config.connect(self.tls.clone()).await?
         };
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::debug!("postgres connection error: {e}");
             }
         });
 
-        configure_session(&client).await?;
-
-        Ok(client)
+        let managed = ManagedClient {
+            client: Some(client),
+            tls: self.tls.clone(),
+            permit: Some(permit),
+            connection_task: task.abort_handle(),
+            metrics: self.metrics.clone(),
+            streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        configure_session(&managed).await?;
+        Ok(managed)
     }
 
     async fn is_valid(
         &self,
-        conn: &mut tokio_postgres::Client,
+        conn: &mut ManagedClient,
     ) -> std::result::Result<(), ConnectionManagerError> {
         conn.simple_query("").await.map(|_| ())?;
         Ok(())
     }
 
-    fn has_broken(&self, conn: &mut tokio_postgres::Client) -> bool {
-        conn.is_closed()
+    fn has_broken(&self, conn: &mut ManagedClient) -> bool {
+        conn.is_closed() || conn.streaming.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 #[derive(Debug)]
 pub struct PostgresConnectionPool {
+    metrics: Arc<ReadMetrics>,
     pool: Arc<bb8::Pool<ConnectionManager>>,
     join_push_down: JoinPushDown,
     unsupported_type_action: UnsupportedTypeAction,
@@ -234,6 +336,10 @@ pub struct PostgresConnectionPool {
 }
 
 impl PostgresConnectionPool {
+    pub fn read_metrics(&self) -> (u64, u64, u64) {
+        self.metrics.snapshot()
+    }
+
     /// Create a bounded pool from a typed connection configuration. No connection-string
     /// interpolation is needed, and the caller controls session options before connecting.
     pub async fn new_with_config(
@@ -244,27 +350,47 @@ impl PostgresConnectionPool {
         acquire_timeout: std::time::Duration,
     ) -> Result<Self> {
         if !(1..=32).contains(&max_connections)
-            || acquire_timeout.is_zero() || acquire_timeout.as_secs() > 60
+            || acquire_timeout.is_zero()
+            || acquire_timeout.as_secs() > 60
         {
-            return InvalidParameterSnafu { parameter_name: "pool limits".to_string() }.fail();
+            return InvalidParameterSnafu {
+                parameter_name: "pool limits".to_string(),
+            }
+            .fail();
         }
         let certs = match rootcert {
-            Some(path) => { let bytes = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?; Some(parse_certs(&bytes)?) },
+            Some(path) => {
+                let bytes = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?;
+                Some(parse_certs(&bytes)?)
+            }
             None => None,
         };
         let tls = get_tls_connector(ssl_mode, certs)?;
         let join_push_down = get_join_context(&config);
+        let manager = ConnectionManager::new(config, MakeTlsConnector::new(tls), max_connections);
+        let metrics = manager.metrics.clone();
         let pool = bb8::Pool::builder()
             .max_size(max_connections)
             .connection_timeout(acquire_timeout)
             .idle_timeout(Some(std::time::Duration::from_secs(60)))
             .max_lifetime(Some(std::time::Duration::from_secs(1800)))
             .error_sink(Box::new(PostgresErrorSink::new()))
-            .build(ConnectionManager::new(config, MakeTlsConnector::new(tls))).await.map_err(map_pool_build_error)?;
-        { let conn = pool.get().await.map_err(map_pool_run_error)?;
-          conn.execute("SELECT 1", &[]).await.context(ConnectionPoolSnafu)?; }
-        Ok(Self { pool: Arc::new(pool), join_push_down,
-            unsupported_type_action: UnsupportedTypeAction::Error, io_handle: None })
+            .build(manager)
+            .await
+            .map_err(map_pool_build_error)?;
+        {
+            let conn = pool.get().await.map_err(map_pool_run_error)?;
+            conn.execute("SELECT 1", &[])
+                .await
+                .context(ConnectionPoolSnafu)?;
+        }
+        Ok(Self {
+            metrics,
+            pool: Arc::new(pool),
+            join_push_down,
+            unsupported_type_action: UnsupportedTypeAction::Error,
+            io_handle: None,
+        })
     }
 
     /// Creates a new instance of `PostgresConnectionPool`.
@@ -419,12 +545,6 @@ impl PostgresConnectionPool {
 
         let join_push_down = get_join_context(&config);
 
-        let mut manager = ConnectionManager::new(config, connector);
-        if let Some(provider) = password_provider {
-            manager = manager.with_password_provider(provider);
-        }
-        let error_sink = PostgresErrorSink::new();
-
         let mut connection_pool_size = 10; // The BB8 default is 10
         if let Some(pg_pool_size) = params
             .get("connection_pool_size")
@@ -435,6 +555,13 @@ impl PostgresConnectionPool {
             })?;
         }
 
+        let mut manager = ConnectionManager::new(config, connector, connection_pool_size);
+        if let Some(provider) = password_provider {
+            manager = manager.with_password_provider(provider);
+        }
+        let error_sink = PostgresErrorSink::new();
+
+        let metrics = manager.metrics.clone();
         let pool = bb8::Pool::builder()
             .max_size(connection_pool_size)
             .error_sink(Box::new(error_sink))
@@ -451,6 +578,7 @@ impl PostgresConnectionPool {
         }
 
         Ok(PostgresConnectionPool {
+            metrics,
             pool: Arc::new(pool),
             join_push_down,
             unsupported_type_action: UnsupportedTypeAction::default(),
@@ -790,8 +918,15 @@ mod bounded_pool_tests {
     #[tokio::test]
     async fn limits_are_rejected_before_network_access() {
         for (size, seconds) in [(0, 5), (33, 5), (2, 0), (2, 61)] {
-            assert!(PostgresConnectionPool::new_with_config(Config::new(), "disable", None,
-                size, std::time::Duration::from_secs(seconds)).await.is_err());
+            assert!(PostgresConnectionPool::new_with_config(
+                Config::new(),
+                "disable",
+                None,
+                size,
+                std::time::Duration::from_secs(seconds)
+            )
+            .await
+            .is_err());
         }
     }
 }

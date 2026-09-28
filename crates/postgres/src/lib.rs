@@ -28,7 +28,7 @@ use datafusion_table_providers_common::sql::arrow_sql_gen::statement::{
 use datafusion_table_providers_common::sql::db_connection_pool::{
     self, dbconnection::DbConnection, DbConnectionPool,
 };
-use datafusion_table_providers_common::sql::sql_provider_datafusion::SqlTable;
+pub use datafusion_table_providers_common::sql::sql_provider_datafusion::SqlTable;
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
 use snafu::prelude::*;
@@ -138,6 +138,19 @@ impl PostgresTableFactory {
     #[must_use]
     pub fn new(pool: Arc<PostgresConnectionPool>) -> Self {
         Self { pool }
+    }
+
+    /// Explicit schema and no automatic federation; callers own capability admission.
+    pub fn declared_table(
+        &self,
+        name: TableReference,
+        schema: SchemaRef,
+    ) -> Arc<SqlTable<PostgresPooledConnection, &'static (dyn ToSql + Sync)>> {
+        let pool: Arc<DynPostgresConnectionPool> = self.pool.clone();
+        Arc::new(
+            SqlTable::new_with_schema("postgres", &pool, schema, name)
+                .with_dialect(Arc::new(PostgreSqlDialect {})),
+        )
     }
 
     pub async fn table_provider(

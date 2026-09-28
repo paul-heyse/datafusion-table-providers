@@ -446,27 +446,47 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         params: &[&'a (dyn ToSql + Sync)],
         projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
+        self.conn
+            .streaming
+            .store(true, std::sync::atomic::Ordering::Release);
+        let streaming = self.conn.streaming.clone();
+        let declared = projected_schema.clone();
         // TODO: We should have a way to detect if params have been passed
         // if they haven't we should use .copy_out instead, because it should be much faster
+        let started = std::time::Instant::now();
+        let metrics = self.conn.metrics.clone();
         let streamable = self
             .conn
             .query_raw(sql, params.iter().copied()) // use .query_raw to get access to the underlying RowStream
             .await
             .context(QuerySnafu)?;
 
+        metrics.query_wait_ns.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // chunk the stream into groups of rows
         let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
             let rows = rows
                 .into_iter()
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context(QuerySnafu)?;
+            let started = std::time::Instant::now();
             let rec = rows_to_arrow(rows.as_slice(), &projected_schema).context(ConversionSnafu)?;
+            metrics.conversion_ns.fetch_add(
+                started.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics
+                .rows
+                .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
             Ok::<_, PostgresError>(rec)
         });
 
         let Some(first_chunk) = stream.next().await else {
+            streaming.store(false, std::sync::atomic::Ordering::Release);
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
+                declared.unwrap_or_else(|| Arc::new(Schema::empty())),
                 stream::empty(),
             )));
         };
@@ -483,9 +503,11 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
                     }
                     Err(e) => {
                         yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
+                        return;
                     }
                 }
            }
+           streaming.store(false,std::sync::atomic::Ordering::Release);
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(

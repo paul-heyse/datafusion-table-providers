@@ -1138,7 +1138,53 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
         columns,
         options,
     ) {
-        Ok(record_batch) => Ok(record_batch),
+        Ok(record_batch) => {
+            if let Some(declared) = projected_schema {
+                let failure = |message: &str| Error::FailedToBuildRecordBatch {
+                    source: arrow::error::ArrowError::SchemaError(message.into()),
+                };
+                if declared.fields().len() != record_batch.num_columns() {
+                    return Err(failure("declared projection column count mismatch"));
+                }
+                let mut arrays = Vec::new();
+                for ((actual, array), wanted) in record_batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(record_batch.columns())
+                    .zip(declared.fields())
+                {
+                    if actual.name() != wanted.name() {
+                        return Err(failure("declared projection column order/name mismatch"));
+                    }
+                    if !wanted.is_nullable() && array.null_count() != 0 {
+                        return Err(failure("declared non-null column contains nulls"));
+                    }
+                    let array = if array.data_type() == wanted.data_type() {
+                        array.clone()
+                    } else if let (DataType::Binary, DataType::FixedSizeBinary(width)) =
+                        (array.data_type(), wanted.data_type())
+                    {
+                        let values = array
+                            .as_any()
+                            .downcast_ref::<arrow::array::BinaryArray>()
+                            .ok_or_else(|| failure("binary representation"))?;
+                        if values.iter().flatten().any(|v| v.len() != *width as usize) {
+                            return Err(failure("declared binary identity width mismatch"));
+                        }
+                        arrow::compute::cast(array, wanted.data_type())
+                            .map_err(|source| Error::FailedToBuildRecordBatch { source })?
+                    } else {
+                        return Err(failure("unqualified declared domain conversion"));
+                    };
+                    arrays.push(array);
+                }
+                RecordBatch::try_new_with_options(declared.clone(), arrays, options)
+                    .map_err(|source| Error::FailedToBuildRecordBatch { source })
+            } else {
+                Ok(record_batch)
+            }
+        }
         Err(e) => Err(e).context(FailedToBuildRecordBatchSnafu),
     }
 }
