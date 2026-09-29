@@ -4,6 +4,8 @@ use std::error::Error;
 use std::sync::Arc;
 
 use crate::arrow_sql_gen::rows_to_arrow;
+use crate::bounded::{BoundedChunks, ChunkLimits};
+use datafusion::execution::memory_pool::MemoryReservation;
 use crate::arrow_sql_gen::schema::pg_data_type_to_arrow_type;
 use crate::arrow_sql_gen::schema::ParseContext;
 use crate::pool::ConnectionManager;
@@ -521,7 +523,152 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     }
 }
 
+/// A bounded read's hold on its connection. When the request ends the connection returns to
+/// its pool; if the stream is dropped mid-read, the read is drained first. A failed drain or a
+/// closed transport loses a bound pool rather than returning an uncertain connection.
+struct Lease {
+    connection: Option<PostgresConnection>,
+    drain_timeout: std::time::Duration,
+}
+
+impl Lease {
+    fn end(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            if connection.conn.is_closed() {
+                connection.conn.mark_lost();
+            }
+            connection.conn.finish_request();
+        }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let timeout = self.drain_timeout;
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let drained = tokio::time::timeout(timeout, connection.conn.drain()).await;
+                    if matches!(drained, Ok(Ok(()))) {
+                        connection.conn.finish_request();
+                    } else {
+                        connection.conn.mark_lost();
+                    }
+                    drop(connection);
+                });
+            }
+            Err(_) => connection.conn.mark_lost(),
+        }
+    }
+}
+
+fn charge(
+    reservation: &Option<MemoryReservation>,
+    retained: usize,
+) -> std::result::Result<(), DataFusionError> {
+    // Retained wire rows plus their Arrow conversion.
+    reservation
+        .as_ref()
+        .map_or(Ok(()), |r| r.try_resize(retained.saturating_mul(2)))
+}
+
 impl PostgresConnection {
+    /// Stream `sql` as batches of exactly the `declared` schema, in row- and byte-bounded
+    /// chunks sized by each row's wire bytes. Retained rows and their conversion are charged to
+    /// `reservation`. The stream owns this connection: at the end of the request it returns to
+    /// its pool; if the stream is dropped mid-read, the read is cancelled and drained within
+    /// `drain_timeout` before the connection returns, and a failed drain loses a bound pool.
+    pub async fn query_arrow_bounded(
+        self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        declared: SchemaRef,
+        limits: ChunkLimits,
+        reservation: Option<MemoryReservation>,
+        drain_timeout: std::time::Duration,
+    ) -> std::result::Result<SendableRecordBatchStream, DataFusionError> {
+        limits
+            .validate()
+            .map_err(|message| DataFusionError::Configuration(message.into()))?;
+        self.conn.start_request();
+        let rows = match self.conn.query_raw(sql, params.iter().copied()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                Lease {
+                    connection: Some(self),
+                    drain_timeout,
+                }
+                .end();
+                return Err(DataFusionError::External(Box::new(
+                    PostgresError::QueryError { source: error },
+                )));
+            }
+        };
+        let mut lease = Lease {
+            connection: Some(self),
+            drain_timeout,
+        };
+        let schema = declared.clone();
+        let output = stream! {
+            let mut rows = std::pin::pin!(rows);
+            let mut chunks = BoundedChunks::new(limits);
+            let mut retained = 0usize;
+            loop {
+                let completed = match rows.next().await {
+                    Some(Ok(row)) => {
+                        let size = row.raw_size_bytes();
+                        if let Err(error) = charge(&reservation, retained.saturating_add(size)) {
+                            yield Err(error);
+                            return;
+                        }
+                        retained += size;
+                        match chunks.push(row, size) {
+                            Ok(completed) => completed,
+                            Err(error) => {
+                                yield Err(DataFusionError::External(Box::new(error)));
+                                return;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        lease.end();
+                        yield Err(DataFusionError::External(Box::new(PostgresError::QueryError { source: error })));
+                        return;
+                    }
+                    None => {
+                        lease.end();
+                        chunks.finish()
+                    }
+                };
+                let ended = lease.connection.is_none();
+                if let Some((rows, bytes)) = completed {
+                    match rows_to_arrow(&rows, &Some(declared.clone())) {
+                        Ok(batch) => {
+                            drop(rows);
+                            retained -= bytes;
+                            let _ = charge(&reservation, retained);
+                            yield Ok(batch);
+                        }
+                        Err(error) => {
+                            yield Err(DataFusionError::External(Box::new(PostgresError::ConversionError { source: error })));
+                            return;
+                        }
+                    }
+                }
+                if ended {
+                    break;
+                }
+            }
+            if let Some(reservation) = &reservation {
+                reservation.free();
+            }
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output)))
+    }
+
     #[must_use]
     pub fn with_unsupported_type_action(mut self, action: UnsupportedTypeAction) -> Self {
         self.unsupported_type_action = action;

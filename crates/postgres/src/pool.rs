@@ -82,6 +82,14 @@ pub enum Error {
 
     #[snafu(display("Task failed to execute on IO runtime.\n{source}"))]
     IoRuntimeError { source: tokio::task::JoinError },
+
+    #[snafu(display("The bound PostgreSQL pool is lost: a connection closed or a cancelled read could not be drained. It never reconnects."))]
+    BoundPoolLost,
+
+    #[snafu(display("Binding a PostgreSQL session failed.\n{source}"))]
+    SessionBindError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -93,6 +101,10 @@ pub enum ConnectionManagerError {
     Postgres(tokio_postgres::Error),
     /// An error from the password provider.
     PasswordProvider(Box<dyn std::error::Error + Send + Sync>),
+    /// A bound pool may not open a connection beyond its prefilled set.
+    Lost,
+    /// The session binder refused a new connection.
+    Bind(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl std::fmt::Display for ConnectionManagerError {
@@ -100,6 +112,8 @@ impl std::fmt::Display for ConnectionManagerError {
         match self {
             Self::Postgres(e) => write!(f, "{e}"),
             Self::PasswordProvider(e) => write!(f, "password provider error: {e}"),
+            Self::Lost => write!(f, "bound pool lost; it never reconnects"),
+            Self::Bind(e) => write!(f, "session binding failed: {e}"),
         }
     }
 }
@@ -108,7 +122,8 @@ impl std::error::Error for ConnectionManagerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Postgres(e) => Some(e),
-            Self::PasswordProvider(e) => Some(e.as_ref()),
+            Self::PasswordProvider(e) | Self::Bind(e) => Some(e.as_ref()),
+            Self::Lost => None,
         }
     }
 }
@@ -149,6 +164,42 @@ pub struct ConnectionManager {
     config: Config,
     tls: MakeTlsConnector,
     password_provider: Option<Arc<dyn PasswordProvider>>,
+    bound: Option<Bound>,
+}
+
+/// Binds each physical connection to its caller's session once, before first use: for example,
+/// by holding a lease on the data it reads and checking that data's identity. A bound pool opens
+/// exactly its prefilled connections and never reconnects, so a binding is never silently
+/// replaced by another.
+#[async_trait]
+pub trait SessionBinder: Send + Sync + std::fmt::Debug {
+    async fn bind(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Limits of a bound pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundLimits {
+    pub connections: u32,
+    pub acquire_timeout: std::time::Duration,
+    /// How long a cancelled read may take to drain before the pool is lost.
+    pub drain_timeout: std::time::Duration,
+}
+
+/// A bound pool is ready until it is lost; loss is terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolHealth {
+    Ready { connections: u32, idle: u32 },
+    Lost,
+}
+
+#[derive(Debug)]
+struct Bound {
+    binder: Arc<dyn SessionBinder>,
+    remaining: std::sync::atomic::AtomicU32,
+    lost: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConnectionManager {
@@ -159,6 +210,7 @@ impl ConnectionManager {
             password_provider: None,
             metrics: Arc::default(),
             permits: Arc::new(tokio::sync::Semaphore::new(capacity as usize)),
+            bound: None,
         }
     }
 
@@ -213,6 +265,8 @@ pub struct ManagedClient {
     tls: MakeTlsConnector,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pub(crate) streaming: Arc<std::sync::atomic::AtomicBool>,
+    /// A bound pool's terminal loss flag, shared by all of its connections.
+    pub(crate) lost: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 impl std::fmt::Debug for ManagedClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -253,6 +307,19 @@ impl Drop for ManagedClient {
     }
 }
 impl ManagedClient {
+    /// Cancel the in-flight request and prove it left the server: CancelRequest has no
+    /// acknowledgement, so a following round trip confirms the drain.
+    pub async fn drain(&self) -> std::result::Result<(), tokio_postgres::Error> {
+        self.cancel_token().cancel_query(self.tls.clone()).await?;
+        self.simple_query("").await?;
+        Ok(())
+    }
+    /// Mark the bound pool this connection belongs to as lost.
+    pub fn mark_lost(&self) {
+        if let Some(lost) = &self.lost {
+            lost.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
     pub fn start_request(&self) {
         self.streaming
             .store(true, std::sync::atomic::Ordering::Release);
@@ -278,6 +345,13 @@ impl bb8::ManageConnection for ConnectionManager {
     type Error = ConnectionManagerError;
 
     async fn connect(&self) -> std::result::Result<ManagedClient, ConnectionManagerError> {
+        if let Some(bound) = &self.bound {
+            use std::sync::atomic::Ordering;
+            if bound.remaining.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_err() {
+                bound.lost.store(true, Ordering::Release);
+                return Err(ConnectionManagerError::Lost);
+            }
+        }
         let permit = self
             .permits
             .clone()
@@ -308,8 +382,12 @@ impl bb8::ManageConnection for ConnectionManager {
             connection_task: task.abort_handle(),
             metrics: self.metrics.clone(),
             streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lost: self.bound.as_ref().map(|bound| bound.lost.clone()),
         };
         configure_session(&managed).await?;
+        if let Some(bound) = &self.bound {
+            bound.binder.bind(&managed).await.map_err(ConnectionManagerError::Bind)?;
+        }
         Ok(managed)
     }
 
@@ -322,7 +400,12 @@ impl bb8::ManageConnection for ConnectionManager {
     }
 
     fn has_broken(&self, conn: &mut ManagedClient) -> bool {
-        conn.is_closed() || conn.streaming.load(std::sync::atomic::Ordering::Acquire)
+        let broken = conn.is_closed() || conn.streaming.load(std::sync::atomic::Ordering::Acquire);
+        if broken {
+            // A bound connection is never replaced; losing one loses the pool.
+            conn.mark_lost();
+        }
+        broken
     }
 }
 
@@ -333,6 +416,8 @@ pub struct PostgresConnectionPool {
     join_push_down: JoinPushDown,
     unsupported_type_action: UnsupportedTypeAction,
     io_handle: Option<Handle>,
+    lost: Option<Arc<std::sync::atomic::AtomicBool>>,
+    drain_timeout: std::time::Duration,
 }
 
 impl PostgresConnectionPool {
@@ -390,7 +475,95 @@ impl PostgresConnectionPool {
             join_push_down,
             unsupported_type_action: UnsupportedTypeAction::Error,
             io_handle: None,
+            lost: None,
+            drain_timeout: std::time::Duration::from_secs(2),
         })
+    }
+
+    /// Create a bound pool: exactly `limits.connections` connections, opened and bound by
+    /// `binder` before this returns, never reaped and never replaced. A closed connection or a
+    /// cancelled read that cannot be drained within `limits.drain_timeout` loses the pool, and
+    /// every later acquisition is refused.
+    pub async fn new_bound(
+        config: Config,
+        ssl_mode: &str,
+        rootcert: Option<PathBuf>,
+        binder: Arc<dyn SessionBinder>,
+        limits: BoundLimits,
+    ) -> Result<Self> {
+        if !(1..=32).contains(&limits.connections)
+            || limits.acquire_timeout.is_zero()
+            || limits.acquire_timeout.as_secs() > 60
+            || limits.drain_timeout.is_zero()
+            || limits.drain_timeout.as_secs() > 60
+        {
+            return InvalidParameterSnafu {
+                parameter_name: "bound pool limits".to_string(),
+            }
+            .fail();
+        }
+        let certs = match rootcert {
+            Some(path) => {
+                let bytes = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?;
+                Some(parse_certs(&bytes)?)
+            }
+            None => None,
+        };
+        let tls = get_tls_connector(ssl_mode, certs)?;
+        let join_push_down = get_join_context(&config);
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut manager = ConnectionManager::new(config, MakeTlsConnector::new(tls), limits.connections);
+        manager.bound = Some(Bound {
+            binder,
+            remaining: std::sync::atomic::AtomicU32::new(limits.connections),
+            lost: lost.clone(),
+        });
+        let metrics = manager.metrics.clone();
+        let pool = bb8::Pool::builder()
+            .max_size(limits.connections)
+            .min_idle(Some(limits.connections))
+            .connection_timeout(limits.acquire_timeout)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .error_sink(Box::new(PostgresErrorSink::new()))
+            .build(manager)
+            .await
+            .map_err(map_pool_build_error)?;
+        let state = pool.state();
+        if state.connections != limits.connections || lost.load(std::sync::atomic::Ordering::Acquire) {
+            return BoundPoolLostSnafu.fail();
+        }
+        Ok(Self {
+            metrics,
+            pool: Arc::new(pool),
+            join_push_down,
+            unsupported_type_action: UnsupportedTypeAction::Error,
+            io_handle: None,
+            lost: Some(lost),
+            drain_timeout: limits.drain_timeout,
+        })
+    }
+
+    /// Whether a bound pool can still serve reads, and its connection counts. An unbound pool
+    /// is never lost.
+    pub fn health(&self) -> PoolHealth {
+        if self.is_lost() {
+            return PoolHealth::Lost;
+        }
+        let state = self.pool.state();
+        PoolHealth::Ready {
+            connections: state.connections,
+            idle: state.idle_connections,
+        }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.as_ref().is_some_and(|lost| lost.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// How long a cancelled read on this pool may take to drain.
+    pub fn drain_timeout(&self) -> std::time::Duration {
+        self.drain_timeout
     }
 
     /// Creates a new instance of `PostgresConnectionPool`.
@@ -583,6 +756,8 @@ impl PostgresConnectionPool {
             join_push_down,
             unsupported_type_action: UnsupportedTypeAction::default(),
             io_handle: None,
+            lost: None,
+            drain_timeout: std::time::Duration::from_secs(2),
         })
     }
 
@@ -606,6 +781,9 @@ impl PostgresConnectionPool {
     ///
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn connect_direct(&self) -> Result<PostgresConnection> {
+        if self.is_lost() {
+            return BoundPoolLostSnafu.fail();
+        }
         let pool = Arc::clone(&self.pool);
         let conn = if let Some(handle) = &self.io_handle {
             handle
@@ -712,6 +890,8 @@ fn map_pool_build_error(e: ConnectionManagerError) -> Error {
     match e {
         ConnectionManagerError::Postgres(e) => Error::ConnectionPoolError { source: e },
         ConnectionManagerError::PasswordProvider(e) => Error::PasswordProviderError { source: e },
+        ConnectionManagerError::Lost => Error::BoundPoolLost,
+        ConnectionManagerError::Bind(e) => Error::SessionBindError { source: e },
     }
 }
 
@@ -723,6 +903,8 @@ fn map_pool_run_error(e: bb8::RunError<ConnectionManagerError>) -> Error {
         bb8::RunError::User(ConnectionManagerError::PasswordProvider(e)) => {
             Error::PasswordProviderError { source: e }
         }
+        bb8::RunError::User(ConnectionManagerError::Lost) => Error::BoundPoolLost,
+        bb8::RunError::User(ConnectionManagerError::Bind(e)) => Error::SessionBindError { source: e },
         bb8::RunError::TimedOut => Error::ConnectionPoolRunError {
             source: bb8::RunError::TimedOut,
         },
@@ -915,6 +1097,23 @@ mod tests {
 #[cfg(test)]
 mod bounded_pool_tests {
     use super::*;
+    #[derive(Debug)]
+    struct Unused;
+    #[async_trait]
+    impl SessionBinder for Unused {
+        async fn bind(&self, _: &tokio_postgres::Client) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!("limits are refused before any connection")
+        }
+    }
+    #[tokio::test]
+    async fn bound_limits_are_rejected_before_network_access() {
+        let second = std::time::Duration::from_secs(1);
+        for (connections, acquire, drain) in [(0, second, second), (33, second, second), (2, std::time::Duration::ZERO, second), (2, second, std::time::Duration::ZERO)] {
+            let limits = BoundLimits { connections, acquire_timeout: acquire, drain_timeout: drain };
+            assert!(matches!(PostgresConnectionPool::new_bound(Config::new(), "disable", None, Arc::new(Unused), limits).await,
+                Err(Error::InvalidParameterError { .. })));
+        }
+    }
     #[tokio::test]
     async fn limits_are_rejected_before_network_access() {
         for (size, seconds) in [(0, 5), (33, 5), (2, 0), (2, 61)] {

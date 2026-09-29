@@ -1,4 +1,5 @@
 pub mod arrow_sql_gen;
+pub mod bounded;
 pub mod conn;
 pub mod pool;
 

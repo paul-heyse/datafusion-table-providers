@@ -1160,24 +1160,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     if !wanted.is_nullable() && array.null_count() != 0 {
                         return Err(failure("declared non-null column contains nulls"));
                     }
-                    let array = if array.data_type() == wanted.data_type() {
-                        array.clone()
-                    } else if let (DataType::Binary, DataType::FixedSizeBinary(width)) =
-                        (array.data_type(), wanted.data_type())
-                    {
-                        let values = array
-                            .as_any()
-                            .downcast_ref::<arrow::array::BinaryArray>()
-                            .ok_or_else(|| failure("binary representation"))?;
-                        if values.iter().flatten().any(|v| v.len() != *width as usize) {
-                            return Err(failure("declared binary identity width mismatch"));
-                        }
-                        arrow::compute::cast(array, wanted.data_type())
-                            .map_err(|source| Error::FailedToBuildRecordBatch { source })?
-                    } else {
-                        return Err(failure("unqualified declared domain conversion"));
-                    };
-                    arrays.push(array);
+                    arrays.push(conform_declared(array, wanted.data_type(), &failure)?);
                 }
                 RecordBatch::try_new_with_options(declared.clone(), arrays, options)
                     .map_err(|source| Error::FailedToBuildRecordBatch { source })
@@ -1186,6 +1169,45 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             }
         }
         Err(e) => Err(e).context(FailedToBuildRecordBatchSnafu),
+    }
+}
+
+/// Conform a decoded array to its declared type: identical types pass, a binary identity
+/// becomes its declared fixed width, and a list conforms element-wise, where a declared non-null
+/// element type is accepted only when no element is null.
+fn conform_declared(
+    array: &ArrayRef,
+    wanted: &DataType,
+    failure: &dyn Fn(&str) -> Error,
+) -> Result<ArrayRef> {
+    if array.data_type() == wanted {
+        return Ok(array.clone());
+    }
+    match (array.data_type(), wanted) {
+        (DataType::Binary, DataType::FixedSizeBinary(width)) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .ok_or_else(|| failure("binary representation"))?;
+            if values.iter().flatten().any(|v| v.len() != *width as usize) {
+                return Err(failure("declared binary identity width mismatch"));
+            }
+            arrow::compute::cast(array, wanted).map_err(|source| Error::FailedToBuildRecordBatch { source })
+        }
+        (DataType::List(_), DataType::List(item)) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<arrow::array::ListArray>()
+                .ok_or_else(|| failure("list representation"))?;
+            if !item.is_nullable() && list.values().null_count() != 0 {
+                return Err(failure("declared non-null list element contains nulls"));
+            }
+            let values = conform_declared(list.values(), item.data_type(), failure)?;
+            let conformed = arrow::array::ListArray::try_new(item.clone(), list.offsets().clone(), values, list.nulls().cloned())
+                .map_err(|source| Error::FailedToBuildRecordBatch { source })?;
+            Ok(Arc::new(conformed))
+        }
+        _ => Err(failure("unqualified declared domain conversion")),
     }
 }
 
@@ -2352,3 +2374,41 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod declared_list_tests {
+    use super::*;
+    use arrow::array::{BinaryBuilder, ListBuilder};
+
+    fn ids(elements: &[Option<&[u8]>]) -> ArrayRef {
+        let mut builder = ListBuilder::new(BinaryBuilder::new());
+        for element in elements {
+            builder.values().append_option(*element);
+        }
+        builder.append(true);
+        Arc::new(builder.finish())
+    }
+    fn declared(nullable: bool) -> DataType {
+        DataType::List(Arc::new(Field::new("item", DataType::FixedSizeBinary(16), nullable)))
+    }
+    fn failure(message: &str) -> Error {
+        Error::FailedToBuildRecordBatch { source: arrow::error::ArrowError::SchemaError(message.into()) }
+    }
+
+    #[test]
+    fn a_list_conforms_to_its_declared_non_null_identity_elements() {
+        let conformed = conform_declared(&ids(&[Some(&[1; 16]), Some(&[2; 16])]), &declared(false), &failure).unwrap();
+        assert_eq!(conformed.data_type(), &declared(false));
+        assert_eq!(conformed.len(), 1);
+    }
+
+    #[test]
+    fn a_null_element_or_a_wrong_width_is_refused() {
+        let null = conform_declared(&ids(&[Some(&[1; 16]), None]), &declared(false), &failure);
+        assert!(null.unwrap_err().to_string().contains("non-null list element"));
+        assert!(conform_declared(&ids(&[Some(&[1; 16]), None]), &declared(true), &failure).is_ok(), "a nullable declaration keeps nulls");
+        let width = conform_declared(&ids(&[Some(&[1; 15])]), &declared(false), &failure);
+        assert!(width.unwrap_err().to_string().contains("width mismatch"));
+    }
+}
+
