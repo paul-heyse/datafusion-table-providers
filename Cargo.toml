@@ -47,7 +47,7 @@ datafusion-physical-expr = { version = "55.0" }
 datafusion-physical-plan = { version = "55.0" }
 datafusion-python = { git = "https://github.com/apache/datafusion-python", branch = "main"}
 datafusion-table-providers = { version = "0.13.1", path = "core" }
-datafusion-table-providers-common = { version = "0.13.1", path = "crates/common" }
+datafusion-table-providers-common = { version = "0.13.1", path = "crates/common", default-features = false }
 datafusion-table-providers-odbc = { version = "0.13.1", path = "crates/odbc" }
 datafusion-table-providers-clickhouse = { version = "0.13.1", path = "crates/clickhouse" }
 datafusion-table-providers-flightsql = { version = "0.13.1", path = "crates/flightsql" }
