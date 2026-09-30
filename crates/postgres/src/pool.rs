@@ -335,6 +335,13 @@ impl Drop for ManagedClient {
     }
 }
 impl ManagedClient {
+    /// A bounded drain failed: abandon this transport terminally, without starting a second
+    /// destructor drain after the request's reservation has been released.
+    pub(crate) fn abort_request(&self) {
+        self.mark_lost();
+        self.streaming.store(false, std::sync::atomic::Ordering::Release);
+        self.connection_task.abort();
+    }
     /// Cancel the in-flight request and prove it left the server: CancelRequest has no
     /// acknowledgement, so a following round trip confirms the drain.
     pub async fn drain(&self) -> std::result::Result<(), tokio_postgres::Error> {

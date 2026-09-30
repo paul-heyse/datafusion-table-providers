@@ -558,12 +558,12 @@ impl Drop for Lease {
                     if matches!(drained, Ok(Ok(()))) {
                         connection.conn.finish_request();
                     } else {
-                        connection.conn.mark_lost();
+                        connection.conn.abort_request();
                     }
                     drop(connection);
                 });
             }
-            Err(_) => connection.conn.mark_lost(),
+            Err(_) => connection.conn.abort_request(),
         }
     }
 }

@@ -74,3 +74,40 @@ async fn cancellation_before_row_stream_creation_drains_without_replacing_the_co
     client.batch_execute(&format!("DROP TABLE IF EXISTS {name}")).await.unwrap();
     driver.abort();
 }
+
+#[tokio::test]
+async fn failed_bounded_drain_aborts_transport_without_a_second_drain() {
+    let (client, connection) = config().connect(NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let name = format!("provider_failed_drain_{}", client.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get::<_,i32>(0));
+    client.batch_execute(&format!("CREATE TABLE {name}(n bigint NOT NULL)")).await.unwrap();
+    client.batch_execute(&format!("BEGIN; LOCK TABLE {name} IN ACCESS EXCLUSIVE MODE")).await.unwrap();
+    let pool = PostgresConnectionPool::new_bound(config(), "disable", None, Arc::new(Binding::default()), limits()).await.unwrap();
+    let connection = pool.connect_direct().await.unwrap();
+    let pid: i32 = connection.conn.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+    let memory: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+    let reservation = MemoryConsumer::new("failed-drain").register(&memory);
+    reservation.try_grow(4096).unwrap();
+    let sql = format!("SELECT n FROM {name}");
+    let future = connection.query_arrow_bounded(&sql, &[], schema(), ChunkLimits::default(), Some(reservation), Duration::ZERO);
+    assert!(tokio::time::timeout(Duration::from_millis(100), future).await.is_err());
+    assert_eq!(memory.reserved(), 4096);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if pool.health() == PoolHealth::Lost && memory.reserved() == 0 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(pool.connect_direct().await.is_err());
+    // Release the server lock so it can observe the already-aborted client socket.
+    client.batch_execute("ROLLBACK").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let alive: bool = client.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)", &[&pid]).await.unwrap().get(0);
+            if !alive { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    client.batch_execute(&format!("DROP TABLE {name}")).await.unwrap();
+    driver.abort();
+}
