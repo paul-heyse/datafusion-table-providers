@@ -593,23 +593,17 @@ impl PostgresConnection {
         limits
             .validate()
             .map_err(|message| DataFusionError::Configuration(message.into()))?;
-        self.conn.start_request();
-        let rows = match self.conn.query_raw(sql, params.iter().copied()).await {
+        self.conn.start_request().map_err(|error| DataFusionError::External(Box::new(error)))?;
+        // Own the drain guard before the first await: cancellation can precede RowStream creation.
+        let mut lease = Lease { connection: Some(self), drain_timeout };
+        let rows = match lease.connection.as_ref().expect("live request").conn.query_raw(sql, params.iter().copied()).await {
             Ok(rows) => rows,
             Err(error) => {
-                Lease {
-                    connection: Some(self),
-                    drain_timeout,
-                }
-                .end();
+                lease.end();
                 return Err(DataFusionError::External(Box::new(
                     PostgresError::QueryError { source: error },
                 )));
             }
-        };
-        let mut lease = Lease {
-            connection: Some(self),
-            drain_timeout,
         };
         let schema = declared.clone();
         let output = stream! {
