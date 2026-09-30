@@ -529,6 +529,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
 struct Lease {
     connection: Option<PostgresConnection>,
     drain_timeout: std::time::Duration,
+    reservation: Option<MemoryReservation>,
 }
 
 impl Lease {
@@ -548,9 +549,11 @@ impl Drop for Lease {
             return;
         };
         let timeout = self.drain_timeout;
+        let reservation = self.reservation.take();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move {
+                    let _reservation = reservation;
                     let drained = tokio::time::timeout(timeout, connection.conn.drain()).await;
                     if matches!(drained, Ok(Ok(()))) {
                         connection.conn.finish_request();
@@ -595,7 +598,7 @@ impl PostgresConnection {
             .map_err(|message| DataFusionError::Configuration(message.into()))?;
         self.conn.start_request().map_err(|error| DataFusionError::External(Box::new(error)))?;
         // Own the drain guard before the first await: cancellation can precede RowStream creation.
-        let mut lease = Lease { connection: Some(self), drain_timeout };
+        let mut lease = Lease { connection: Some(self), drain_timeout, reservation };
         let rows = match lease.connection.as_ref().expect("live request").conn.query_raw(sql, params.iter().copied()).await {
             Ok(rows) => rows,
             Err(error) => {
@@ -614,7 +617,7 @@ impl PostgresConnection {
                 let completed = match rows.next().await {
                     Some(Ok(row)) => {
                         let size = row.raw_size_bytes();
-                        if let Err(error) = charge(&reservation, retained.saturating_add(size)) {
+                        if let Err(error) = charge(&lease.reservation, retained.saturating_add(size)) {
                             yield Err(error);
                             return;
                         }
@@ -643,7 +646,7 @@ impl PostgresConnection {
                         Ok(batch) => {
                             drop(rows);
                             retained -= bytes;
-                            let _ = charge(&reservation, retained);
+                            let _ = charge(&lease.reservation, retained);
                             yield Ok(batch);
                         }
                         Err(error) => {
@@ -656,7 +659,7 @@ impl PostgresConnection {
                     break;
                 }
             }
-            if let Some(reservation) = &reservation {
+            if let Some(reservation) = &lease.reservation {
                 reservation.free();
             }
         };

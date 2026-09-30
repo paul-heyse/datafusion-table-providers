@@ -5,6 +5,7 @@ use arrow_schema::{Schema, Field, DataType};
 use async_trait::async_trait;
 use datafusion_table_providers_postgres::{pool::{PostgresConnectionPool, SessionBinder, BoundLimits, PoolHealth}, bounded::ChunkLimits};
 use futures::TryStreamExt;
+use datafusion::execution::memory_pool::{MemoryPool, MemoryConsumer, GreedyMemoryPool};
 use tokio_postgres::{Client, Config, NoTls};
 
 #[derive(Debug, Default)]
@@ -53,14 +54,19 @@ async fn cancellation_before_row_stream_creation_drains_without_replacing_the_co
     let pool = PostgresConnectionPool::new_bound(config(), "disable", None, binding.clone(), limits()).await.unwrap();
     let connection = pool.connect_direct().await.unwrap();
     let sql = format!("SELECT n FROM {name}");
-    let future = connection.query_arrow_bounded(&sql, &[], schema(), ChunkLimits::default(), None, limits().drain_timeout);
+    let memory: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+    let reservation = MemoryConsumer::new("cancelled-scan").register(&memory);
+    reservation.try_grow(4096).unwrap();
+    let future = connection.query_arrow_bounded(&sql, &[], schema(), ChunkLimits::default(), Some(reservation), limits().drain_timeout);
     assert!(tokio::time::timeout(Duration::from_millis(100), future).await.is_err());
+    assert_eq!(memory.reserved(), 4096, "dropped future retains its charge in the queued drain");
     client.batch_execute("ROLLBACK").await.unwrap();
     for _ in 0..100 {
         if matches!(pool.health(), PoolHealth::Ready { idle: 1, .. }) { break; }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(matches!(pool.health(), PoolHealth::Ready { connections: 1, idle: 1 }));
+    assert_eq!(memory.reserved(), 0, "confirmed drain releases its reservation");
     let rows = pool.connect_direct().await.unwrap().query_arrow_bounded("SELECT 2::bigint AS n", &[], schema(), ChunkLimits::default(), None, limits().drain_timeout).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(rows[0].num_rows(), 1);
     assert_eq!(binding.acquired.load(Ordering::SeqCst), 1);
